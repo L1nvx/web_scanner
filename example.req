@@ -1,0 +1,23 @@
+POST /product/template?productId=7 HTTP/2
+Host: 0a5f000204bb478282d7e55d004900f3.web-security-academy.net
+Cookie: session=QiNQXr2lQm8GyFiTA7YUtjB1zFKLY0sm
+Content-Length: 75
+Cache-Control: max-age=0
+Sec-Ch-Ua: "Chromium";v="139", "Not;A=Brand";v="99"
+Sec-Ch-Ua-Mobile: ?0
+Sec-Ch-Ua-Platform: "Linux"
+Accept-Language: es-419,es;q=0.9
+Origin: https://0a5f000204bb478282d7e55d004900f3.web-security-academy.net
+Content-Type: application/x-www-form-urlencoded
+Upgrade-Insecure-Requests: 1
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36
+Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7
+Sec-Fetch-Site: same-origin
+Sec-Fetch-Mode: navigate
+Sec-Fetch-User: ?1
+Sec-Fetch-Dest: document
+Referer: https://0a5f000204bb478282d7e55d004900f3.web-security-academy.net/product/template?productId=7
+Accept-Encoding: gzip, deflate, br
+Priority: u=0, i
+
+csrf=EeA4wLxKbDjxEk5cWlKbJBuoytjjOITI&template=FUZZ&template-action=preview
