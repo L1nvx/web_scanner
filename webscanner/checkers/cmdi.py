@@ -1,31 +1,27 @@
-import random
-import string
+"""Command Injection checker — differential echo + time-based detection."""
+
 import re
+from typing import Optional, List
+
+import httpx
+
+from webscanner.checkers.base import BaseChecker
+from webscanner.core.models import CheckResult, BaselineData
 
 
-def _rand(n: int = 8) -> str:
-    abc = string.ascii_letters + string.digits
-    return "".join(random.choice(abc) for _ in range(n))
+class CMDi(BaseChecker):
 
+    name = "Command Injection"
 
-class CMDi:
-    """
-    Command Injection (Unix/Windows) con:
-      - Marcador en respuesta: echo/print (si el resultado del comando se refleja).
-      - Time-based: sleep/ping/timeout.
-    """
-
-    def __init__(self, sleep_s: int = 3, time_threshold: float = 2.2):
-        self.name = "Command Injection"
-        self.canary = _rand()
+    def __init__(self, sleep_s: int = 5, time_margin: float = 2.0):
         self.sleep_s = sleep_s
-        self.time_threshold = time_threshold
+        self.time_margin = time_margin
+        self.canary = self.rand(10)
 
         c = self.canary
         s = self.sleep_s
 
-        # Separadores: ; | || && ` $()  $(())
-        sep = [";", "|", "||", "&&"]
+        separators = [";", "|", "||", "&&"]
         unix_echo = [f"echo {c}", f"printf {c}"]
         unix_sleep = [f"sleep {s}", f"ping -c {s} 127.0.0.1"]
         win_echo = [f"echo {c}"]
@@ -33,63 +29,74 @@ class CMDi:
 
         payloads = set()
 
-        # Unix: salida visible
-        for e in unix_echo:
-            payloads.update({
-                f"{sep_}{e}" for sep_ in sep
-            } | {
-                f"`{e}`",
-                f"$({e})",
-            })
+        # Unix: echo (output-based)
+        for cmd in unix_echo:
+            for sep in separators:
+                payloads.add(f"{sep}{cmd}")
+            payloads.add(f"`{cmd}`")
+            payloads.add(f"$({cmd})")
+            payloads.add(f"\n{cmd}")
 
-        # Unix: solo tiempo
-        for t in unix_sleep:
-            payloads.update({
-                f"{sep_}{t}" for sep_ in sep
-            } | {
-                f"`{t}`",
-                f"$({t})",
-            })
+        # Unix: sleep (time-based)
+        for cmd in unix_sleep:
+            for sep in separators:
+                payloads.add(f"{sep}{cmd}")
+            payloads.add(f"`{cmd}`")
+            payloads.add(f"$({cmd})")
+            payloads.add(f"\n{cmd}")
 
-        # Windows: salida visible
-        for e in win_echo:
-            payloads.update({
-                f"{sep_}{e}" for sep_ in sep
-            })
+        # Windows: echo
+        for cmd in win_echo:
+            for sep in separators:
+                payloads.add(f"{sep}{cmd}")
 
-        # Windows: tiempo
-        for t in win_sleep:
-            payloads.update({
-                f"{sep_}{t}" for sep_ in sep
-            })
+        # Windows: sleep
+        for cmd in win_sleep:
+            for sep in separators:
+                payloads.add(f"{sep}{cmd}")
 
-        # Variantes con cierre de comillas comunes
-        quotes = ["", "'", '"', ")"]
+        # Add variants with quote-closing prefixes
+        quotes = ["'", '"', ")"]
         enriched = set()
         for p in payloads:
+            enriched.add(p)
             for q in quotes:
                 enriched.add(q + p)
-        self.payloads = list(enriched)
 
-        # regex de detección de canario
+        self.payloads_list = list(enriched)
         self._canary_rx = re.compile(re.escape(self.canary))
 
-    def get_payloads(self):
-        return self.payloads
+    def get_payloads(self) -> List[str]:
+        return self.payloads_list
 
-    def check_response(self, response) -> bool:
+    def check(self, baseline: BaselineData, response: httpx.Response, payload: str) -> Optional[CheckResult]:
         body = response.text or ""
 
-        # 1) contenido reflejado
-        if self._canary_rx.search(body):
-            return True
+        # ── 1. Echo-based (differential): canary NOT in baseline, YES in injected ──
+        if self._canary_rx.search(body) and not self._canary_rx.search(baseline.body):
+            return CheckResult(
+                vuln_name=self.name,
+                severity="critical",
+                confidence="confirmed",
+                location="", param="", payload=payload,
+                status_code=response.status_code,
+                evidence=f"Canary '{self.canary}' reflected in response",
+            )
 
-        # 2) time-based
+        # ── 2. Time-based (differential) ──
         try:
             elapsed = response.elapsed.total_seconds()
-            if elapsed >= self.time_threshold:
-                return True
+            threshold = baseline.elapsed + self.sleep_s - self.time_margin
+            if threshold > 0 and elapsed >= threshold:
+                return CheckResult(
+                    vuln_name=self.name,
+                    severity="high",
+                    confidence="tentative",
+                    location="", param="", payload=payload,
+                    status_code=response.status_code,
+                    evidence=f"Time: baseline={baseline.elapsed:.2f}s, injected={elapsed:.2f}s",
+                )
         except Exception:
             pass
 
-        return False
+        return None

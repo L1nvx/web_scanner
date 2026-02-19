@@ -1,94 +1,130 @@
+"""SQL Injection checker — error-based + time-based with differential detection."""
+
 import re
-from statistics import median
+from typing import Optional, List
+
+import httpx
+
+from webscanner.checkers.base import BaseChecker
+from webscanner.core.models import CheckResult, BaselineData
 
 
-class SQLi:
-    def __init__(self, sleep_s: int = 3, time_threshold: float = 2.2):
-        self.name = "SQL Injection"
+class SQLi(BaseChecker):
+
+    name = "SQL Injection"
+
+    def __init__(self, sleep_s: int = 5, time_margin: float = 2.0):
         self.sleep_s = sleep_s
-        self.time_threshold = time_threshold
-        self._baseline = None
+        self.time_margin = time_margin   # injected.elapsed >= baseline.elapsed + sleep_s - margin
 
         s = self.sleep_s
-        self.payloads = [
-            # MySQL
+        self.payloads_list = [
+            # ── Error-based probes ──
+            "'",
+            '"',
+            "' OR '1'='1",
+            '" OR "1"="1',
+            "' OR 1=1-- -",
+            '" OR 1=1-- -',
+            "1' ORDER BY 1-- -",
+            '1" ORDER BY 1-- -',
+            "') OR ('1'='1",
+            "1 UNION SELECT NULL-- -",
+
+            # ── Time-based: MySQL ──
             f"' OR SLEEP({s})-- -",
             f'" OR SLEEP({s})-- -',
-            f"' AND IF(1=1, SLEEP({s}), 0)-- -",
-            f'" AND IF(1=1, SLEEP({s}), 0)-- -',
-            # MSSQL
-            f"' WAITFOR DELAY '0:0:{s}'-- -",
-            f'" WAITFOR DELAY "0:0:{s}"-- -',
-            # PostgreSQL
+            f"' AND IF(1=1,SLEEP({s}),0)-- -",
+            f'" AND IF(1=1,SLEEP({s}),0)-- -',
+            f"1' AND SLEEP({s})-- -",
+
+            # ── Time-based: PostgreSQL ──
             f"' OR pg_sleep({s})-- -",
             f'" OR pg_sleep({s})-- -',
-            # Oracle
-            f"' AND DBMS_LOCK.SLEEP({s}) --",
-            f'" AND DBMS_LOCK.SLEEP({s}) --',
-            # SQLite (peso)
-            "' AND randomblob(100000)-- -",
-            '" AND randomblob(100000)-- -',
+            f"'; SELECT pg_sleep({s})-- -",
+
+            # ── Time-based: MSSQL ──
+            f"'; WAITFOR DELAY '0:0:{s}'-- -",
+            f'"; WAITFOR DELAY \'0:0:{s}\'-- -',
+
+            # ── Time-based: Oracle ──
+            f"' AND DBMS_LOCK.SLEEP({s})-- -",
+
+            # ── Time-based: SQLite ──
+            "' AND randomblob(200000000)-- -",
+            '" AND randomblob(200000000)-- -',
         ]
 
-        # SOLO errores reales, sin patrones de 'sleep(' reflejados
-        self._err_rx = [
+        # Error regex patterns — only real SQL errors
+        self._err_patterns = [
             # MySQL / MariaDB
-            r"SQL syntax.*MySQL",
-            r"You have an error in your SQL syntax",
-            r"Warning.*mysql_",
-            r"Unknown column.*in.*field list",
-            r"Table.*doesn't exist",
+            re.compile(r"You have an error in your SQL syntax", re.I),
+            re.compile(r"SQL syntax.*MySQL", re.I),
+            re.compile(r"Warning.*\bmysql_", re.I),
+            re.compile(r"Unknown column.*in.*field list", re.I),
+            re.compile(r"Table '.*' doesn't exist", re.I),
             # PostgreSQL
-            r"PostgreSQL.*ERROR",
-            r"syntax error at or near",
-            r"relation.*does not exist",
-            r"duplicate key value violates unique constraint",
+            re.compile(r"PostgreSQL.*ERROR", re.I),
+            re.compile(r"syntax error at or near", re.I),
+            re.compile(r'relation ".*" does not exist', re.I),
             # MSSQL
-            r"Unclosed quotation mark after the character string",
-            r"Incorrect syntax near",
-            r"ODBC SQL Server Driver",
-            r"Login failed for user",
+            re.compile(r"Unclosed quotation mark after the character string", re.I),
+            re.compile(r"Incorrect syntax near", re.I),
+            re.compile(r"\bODBC\b.*\bSQL Server\b", re.I),
             # Oracle
-            r"ORA-\d+",
-            r"ORA-00942: table or view does not exist",
-            r"ORA-00001: unique constraint.*violated",
+            re.compile(r"ORA-\d{4,5}:", re.I),
             # SQLite
-            r"SQLite.*error",
-            r"no such table",
-            r"constraint failed",
-            # Genéricos / ORM
-            r"PDOException",
-            r"QueryException",
-            r"SQLSTATE\[\d+\]",
-            # Union info-schema (si se refleja en error/página)
-            r"union.*select.*from",
-            r"select.*from.*information_schema",
+            re.compile(r"SQLite.*error", re.I),
+            re.compile(r"\bno such table\b", re.I),
+            # ORM / Generic
+            re.compile(r"PDOException", re.I),
+            re.compile(r"SQLSTATE\[\w+\]", re.I),
+            re.compile(r"QueryException", re.I),
         ]
-        self._err_compiled = [re.compile(p, re.I) for p in self._err_rx]
 
-    def set_baseline(self, seconds: float):
-        self._baseline = seconds
+    def get_payloads(self) -> List[str]:
+        return self.payloads_list
 
-    def get_payloads(self):
-        return self.payloads
-
-    def check_response(self, response) -> bool:
+    def check(self, baseline: BaselineData, response: httpx.Response, payload: str) -> Optional[CheckResult]:
         body = response.text or ""
 
-        # Error-based
-        if response.status_code >= 500:
-            return True
-        for rx in self._err_compiled:
-            if rx.search(body):
-                return True
+        # ── 1. Error-based (differential): error NOT in baseline, YES in injected ──
+        for rx in self._err_patterns:
+            if rx.search(body) and not rx.search(baseline.body):
+                return CheckResult(
+                    vuln_name=self.name,
+                    severity="high",
+                    confidence="confirmed",
+                    location="", param="", payload=payload,
+                    status_code=response.status_code,
+                    evidence=f"SQL error: {rx.pattern[:60]}",
+                )
 
-        # Time-based
-        if self._baseline is not None:
-            try:
-                delta = response.elapsed.total_seconds() - self._baseline
-                if delta >= self.time_threshold:
-                    return True
-            except Exception:
-                pass
+        # ── 2. Status-code flip (200 → 500) ──
+        if baseline.status_code < 400 and response.status_code >= 500:
+            return CheckResult(
+                vuln_name=self.name,
+                severity="high",
+                confidence="tentative",
+                location="", param="", payload=payload,
+                status_code=response.status_code,
+                evidence=f"Status flip {baseline.status_code} → {response.status_code}",
+            )
 
-        return False
+        # ── 3. Time-based (differential) ──
+        try:
+            elapsed = response.elapsed.total_seconds()
+            threshold = baseline.elapsed + self.sleep_s - self.time_margin
+            if threshold > 0 and elapsed >= threshold:
+                return CheckResult(
+                    vuln_name=self.name,
+                    severity="high",
+                    confidence="tentative",
+                    location="", param="", payload=payload,
+                    status_code=response.status_code,
+                    evidence=f"Time: baseline={baseline.elapsed:.2f}s, injected={elapsed:.2f}s",
+                )
+        except Exception:
+            pass
+
+        return None

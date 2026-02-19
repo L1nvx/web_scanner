@@ -1,83 +1,119 @@
-import random
-import string
+"""Reflected XSS checker — differential canary reflection detection."""
+
 import re
 from html import unescape
+from typing import Optional, List
+
+import httpx
+
+from webscanner.checkers.base import BaseChecker
+from webscanner.core.models import CheckResult, BaselineData
 
 
-def _rand(n: int = 8) -> str:
-    s = string.ascii_letters + string.digits
-    return "".join(random.choice(s) for _ in range(n))
+class XSS(BaseChecker):
 
-
-class XSS:
-    """
-    Reflected XSS básico.
-    Estrategia:
-      1) Inyecta canario + payloads típicos.
-      2) Marca vulnerable si el canario aparece sin escapar en contexto HTML/atributo/JS.
-      3) Ignora apariciones solo escapadas (&lt; &gt; &quot; &#x27; etc.).
-    Limitación: sin DOM; no ejecuta JS. Heurística de servidor.
-    """
+    name = "Cross-Site Scripting (Reflected XSS)"
 
     def __init__(self):
-        self.name = "Cross-Site Scripting (Reflected XSS)"
-        self.canary = _rand()
+        self.canary = self.rand(10)
         c = self.canary
-        # Variantes que cubren texto, atributo, y cierre de etiqueta
-        self.payloads = [
+
+        self.payloads_list = [
+            # Break out of text context
             f"{c}<script>alert(1)</script>",
-            f"{c}\"><svg/onload=alert(1)>",
+            f'{c}"><svg/onload=alert(1)>',
             f"{c}'><img src=x onerror=alert(1)>",
+            # Break out of tag context
             f"{c}</title><svg/onload=alert(1)>",
-            # rompe comentario HTML
+            f"{c}</textarea><script>alert(1)</script>",
+            # Break out of HTML comment
             f"{c}--><svg/onload=alert(1)>",
-            f"{c}</script><script>alert(1)</script>",       # sale de <script>
-            f"{c}\"><body onfocus=alert(1) autofocus>",     # atributo
-            f"{c}`-alert(1)-`",                             # contextos raros
+            # Break out of script context
+            f"{c}</script><script>alert(1)</script>",
+            # Attribute context
+            f'{c}"><body onfocus=alert(1) autofocus>',
+            f"{c}' autofocus onfocus=alert(1) x='",
+            # Template literal context
+            f"{c}`-alert(1)-`",
+            # Event handler via IMG
+            f'{c}"><img src=x onerror=alert(1)//>',
         ]
 
-        # patrones que indican que NO está escapado correctamente
-        self._danger_patterns = [
-            # canario seguido por < o >
-            re.compile(re.escape(self.canary) + r".*<", re.S | re.I),
-            re.compile(re.escape(self.canary) + r".*>", re.S | re.I),
-            # cierre abrupto de atributo y nueva etiqueta
-            re.compile(re.escape(self.canary) + r".*['\"]>\s*<", re.S | re.I),
-            # aparición de <script> / onerror / onload no escapados
-            re.compile(r"<script[^>]*>", re.I),
-            re.compile(r"\sonerror\s*=", re.I),
-            re.compile(r"\sonload\s*=", re.I),
-            # svg handlers
-            re.compile(r"<svg[^>]*>", re.I),
+        # Regex for the injected canary appearing alongside unescaped dangerous chars
+        self._canary_rx = re.compile(re.escape(self.canary))
+
+    def get_payloads(self) -> List[str]:
+        return self.payloads_list
+
+    def check(self, baseline: BaselineData, response: httpx.Response, payload: str) -> Optional[CheckResult]:
+        body = response.text or ""
+
+        # 1. Canary must NOT be in baseline (proves it's reflected, not pre-existing)
+        if self._canary_rx.search(baseline.body):
+            return None
+
+        # 2. Canary must be present in the injected response
+        if not self._canary_rx.search(body):
+            return None
+
+        # 3. Check if reflection is unescaped (dangerous)
+        if self._is_unescaped_reflection(body, payload):
+            return CheckResult(
+                vuln_name=self.name,
+                severity="high",
+                confidence="confirmed",
+                location="", param="", payload=payload,
+                status_code=response.status_code,
+                evidence="Payload reflected unescaped in response",
+            )
+
+        # 4. Canary reflected but possibly escaped — lower confidence
+        if self._has_partial_reflection(body):
+            return CheckResult(
+                vuln_name=self.name,
+                severity="medium",
+                confidence="tentative",
+                location="", param="", payload=payload,
+                status_code=response.status_code,
+                evidence="Canary reflected (possibly escaped)",
+            )
+
+        return None
+
+    def _is_unescaped_reflection(self, body: str, payload: str) -> bool:
+        """Check if the EXACT payload appears in the body without HTML-encoding."""
+        # The full payload (canary + dangerous chars) must appear as-is
+        if payload in body:
+            return True
+
+        # Check for common dangerous fragments near the canary
+        c = self.canary
+        danger = [
+            f"{c}<script",
+            f"{c}<svg",
+            f"{c}<img",
+            f"{c}</script>",
+            f"{c}</title>",
+            f"{c}</textarea>",
+            f'{c}">',
+            f"{c}'>",
         ]
-
-    def get_payloads(self):
-        return self.payloads
-
-    def _looks_escaped(self, text: str) -> bool:
-        """
-        Si el canario aparece solo en forma escapada (&lt; &gt; &quot; &#x27;),
-        consideramos que está neutralizado para reflejo básico.
-        """
-        raw = text
-        esc = unescape(text)
-        # Si desescapar no cambia nada, y alrededor del canario no hay tokens peligrosos, podría estar escapado
-        only_entities = (
-            "&lt;" in raw or "&gt;" in raw or "&quot;" in raw or "&#x27;" in raw)
-        return only_entities and ("<" not in esc and ">" not in esc)
-
-    def check_response(self, response) -> bool:
-        body = response.text
-        if self.canary not in body:
-            return False  # no hay reflexión
-        if self._looks_escaped(body):
-            return False  # parece escapado
-
-        # Heurística: canario presente + algún patrón peligroso no escapado
-        for rx in self._danger_patterns:
-            if rx.search(body):
+        body_lower = body.lower()
+        for d in danger:
+            if d.lower() in body_lower:
                 return True
-        # fallback: canario seguido de paréntesis que suelen denotar JS ejecutable
-        if re.search(re.escape(self.canary) + r".*\balert\s*\(", body, re.I | re.S):
+
+        return False
+
+    def _has_partial_reflection(self, body: str) -> bool:
+        """Canary is present but we couldn't confirm unescaped injection."""
+        # Check if entities are used around canary (signs of escaping)
+        idx = body.find(self.canary)
+        if idx < 0:
+            return False
+        # Look at the 200 chars after the canary
+        snippet = body[idx:idx + 200]
+        # If snippet contains raw < or > near canary, could be dangerous
+        if "<" in snippet or ">" in snippet:
             return True
         return False

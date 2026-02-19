@@ -1,29 +1,33 @@
-from typing import Dict
-from urllib.parse import parse_qs, urlsplit
-from os import path
+"""HTTP request representation — from raw file or from URL."""
+
+from typing import Dict, Optional
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 import json
 
 
+def _flatten_qs(qs: dict) -> dict:
+    """Flatten parse_qs output: {'key': ['val']} → {'key': 'val'}."""
+    return {k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in qs.items()}
+
+
 class Request:
-    def __init__(self, requestFilename: str) -> None:
-        """
-        GET / HTTP/1.1
-        Host: example.com
-        Content-Type: xxx
+    """
+    Represents an HTTP request to scan.
+    Can be built from a raw request file (parse) or from a URL (from_url).
+    """
 
-        data=xxx
-        """
-
+    def __init__(self, requestFilename: str = ""):
         self.method = ""
         self.path = ""
-        self.parameters = {}
-        self.headers = {}
+        self.parameters: Dict = {}
+        self.headers: Dict = {}
         self.body = {}
-
+        self.host = ""
         self.requestFilename = requestFilename
 
-    def parse(self) -> Dict:
+    # ── Build from raw request file ────────────────────────────
 
+    def parse(self) -> Dict:
         with open(self.requestFilename, 'r', encoding='utf-8', errors='ignore') as f:
             raw = f.read().replace("\r\n", "\n")
 
@@ -33,18 +37,17 @@ class Request:
 
         lines = [l for l in head.split("\n") if l.strip()]
 
-        # Línea de petición: METHOD SP PATH [SP HTTP/x.y]
+        # Request line: METHOD SP PATH [SP HTTP/x.y]
         parts0 = lines[0].split()
         if len(parts0) < 2:
             raise ValueError(f"Invalid request line: {lines[0]!r}")
         self.method = parts0[0]
         raw_path = parts0[1]
 
-        # Separar path y query
+        # Separate path and query
         url_parts = urlsplit(raw_path)
-        self.path = url_parts.path                      # sin query
-        self.parameters = dict(
-            parse_qs(url_parts.query, keep_blank_values=True))
+        self.path = url_parts.path
+        self.parameters = _flatten_qs(parse_qs(url_parts.query, keep_blank_values=True))
 
         # Headers
         self.headers = {}
@@ -62,88 +65,77 @@ class Request:
                 try:
                     self.body = json.loads(body_raw)
                 except Exception:
-                    self.body = body_raw  # deja crudo si no es JSON válido
+                    self.body = body_raw
             elif "application/x-www-form-urlencoded" in ctype:
                 self.body = dict(parse_qs(body_raw, keep_blank_values=True))
             else:
                 self.body = body_raw
 
-        # Host y limpieza de headers problemáticos
+        # Host
         self.host = self.headers.get('Host', self.headers.get('host', ''))
         self.headers.pop('Content-Length', None)
 
         return {
-            'host': self.host,
-            'method': self.method,
-            'path': self.path,
-            'parameters': self.parameters,
-            'headers': self.headers,
-            'body': self.body
+            'host': self.host, 'method': self.method, 'path': self.path,
+            'parameters': self.parameters, 'headers': self.headers, 'body': self.body,
         }
 
-    # def parse(self) -> Dict:
-    #     if not path.exists(self.requestFilename):
-    #         raise FileNotFoundError(
-    #             f"Request file '{self.requestFilename}' does not exist.")
+    # ── Build from URL string ──────────────────────────────────
 
-    #     with open(self.requestFilename, 'r') as file:
-    #         lines = file.readlines()
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        method: str = "GET",
+        body: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+        content_type: str = "",
+    ) -> "Request":
+        """
+        Build a Request from a URL + optional body.
 
-    #     if len(lines) == 0:
-    #         raise ValueError("Request file is empty.")
+        Examples:
+            Request.from_url("http://example.com/?id=1")
+            Request.from_url("http://example.com/login", method="POST",
+                             body={"user": "", "pass": ""},
+                             content_type="application/x-www-form-urlencoded")
+        """
+        req = cls()
+        parts = urlsplit(url)
 
-    #     body_index = 0
-    #     for i, line in enumerate(lines):
-    #         if line.strip() == "":
-    #             body_index = i
-    #             break
+        req.host = parts.hostname or ""
+        if parts.port and parts.port not in (80, 443):
+            req.host = f"{req.host}:{parts.port}"
 
-    #     lines = [line.strip() for line in lines if line.strip()]
-    #     # Get method
-    #     self.method = lines[0].split()[0]
+        req.method = method.upper()
+        req.path = parts.path or "/"
+        req.parameters = _flatten_qs(parse_qs(parts.query, keep_blank_values=True))
 
-    #     # Get path
-    #     self.path = lines[0].split()[1]
+        req.headers = headers or {}
+        if "Host" not in req.headers and "host" not in req.headers:
+            req.headers["Host"] = req.host
+        if content_type:
+            req.headers["Content-Type"] = content_type
 
-    #     # Get headers
-    #     for line in lines[:body_index]:
-    #         if ':' in line:
-    #             key, value = line.split(':', 1)
-    #             self.headers[key.strip()] = value.strip()
-    #     # Get parameters
-    #     if '?' in self.path:
-    #         self.parameters = parse_qs(self.path.split('?', 1)[1])
+        req.body = body or {}
 
-    #     # Get body; JSON OR form-urlencoded
-    #     if body_index > 0:
-    #         body_data = ''.join([unquote(x) for x in lines[body_index:]])
-    #         if '{' in body_data and '}' in body_data and ':' in body_data and '"' in body_data:
-    #             try:
-    #                 self.body = json.loads(body_data)
-    #             except Exception as e:
-    #                 print(e)
-    #         else:
-    #             if '=' in body_data:
-    #                 self.body = parse_qs(body_data)
-    #     self.host = self.headers.get('Host', '')
-    #     return {
-    #         'host': self.host,
-    #         'method': self.method,
-    #         'path': self.path,
-    #         'parameters': self.parameters,
-    #         'headers': self.headers,
-    #         'body': self.body
-    #     }
+        return req
+
+    # ── Utility ────────────────────────────────────────────────
+
+    @property
+    def full_url(self) -> str:
+        """Reconstruct the full URL for display purposes."""
+        scheme = "https"  # default
+        query = "&".join(
+            f"{k}={v[0] if isinstance(v, list) else v}"
+            for k, v in self.parameters.items()
+        ) if self.parameters else ""
+        return urlunsplit((scheme, self.host, self.path, query, ""))
 
     def __str__(self) -> str:
-        return f"Method: {self.method}\nPath: {self.path}\nHost: {self.host}\nParameters: {self.parameters}\nHeaders: {self.headers}\nBody: {self.body}"
+        return (f"Method: {self.method}\nPath: {self.path}\nHost: {self.host}\n"
+                f"Parameters: {self.parameters}\nHeaders: {self.headers}\nBody: {self.body}")
 
-
-if __name__ == '__main__':
-    request = Request()
-    try:
-        request.parse('/tmp/example.req')
-    except Exception as e:
-        print(f"Error: {e}")
-    else:
-        print("Request parsed successfully.")
+    def __repr__(self) -> str:
+        return f"<Request {self.method} {self.host}{self.path}>"
