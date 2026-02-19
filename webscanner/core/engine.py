@@ -1,22 +1,25 @@
-"""Scan engine — orchestrates baseline + injection + differential detection.
+"""Async scan engine — orchestrates baseline + injection + differential detection.
 
-Handles CSRF token detection and refresh: if a form contains fields that look
-like anti-CSRF tokens, the engine fetches fresh tokens before each injection.
+Uses httpx.AsyncClient with asyncio.Semaphore for controlled concurrency.
+Handles CSRF token detection and refresh.
 """
 
+import asyncio
 import httpx
 from copy import deepcopy
 from typing import List, Optional
-from urllib.parse import urlunsplit, urlsplit
 
 from colorama import Style
 
 from webscanner.checkers.base import BaseChecker
 from webscanner.core.models import CheckResult, BaselineData
-from webscanner.core.csrf import detect_csrf_fields, fetch_csrf_tokens
+from webscanner.core.csrf import detect_csrf_fields, async_fetch_csrf_tokens
 from webscanner.parsers.request import Request
 
 _STOP_HDRS = {"host", "content-length", "transfer-encoding", "content-encoding"}
+
+# Default concurrency: how many requests in-flight at once
+DEFAULT_CONCURRENCY = 15
 
 
 class Engine:
@@ -26,17 +29,23 @@ class Engine:
         protocol: str = "https",
         logger=None,
         timeout: int = 15,
+        concurrency: int = DEFAULT_CONCURRENCY,
     ):
         self.name = "WebScanner"
-        self.version = "2.2.0"
+        self.version = "2.3.0"
         self.protocol = protocol
         self.logger = logger
-        self.client = httpx.Client(
+        self.concurrency = concurrency
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.client = httpx.AsyncClient(
             verify=False,
             proxy=proxy,
             follow_redirects=True,
             timeout=timeout,
         )
+
+    async def close(self):
+        await self.client.aclose()
 
     # ── host helper ─────────────────────────────────────────────
 
@@ -84,11 +93,6 @@ class Engine:
     # ── page URL helper (for CSRF token refresh) ────────────────
 
     def _form_page_url(self, request: Request) -> str:
-        """Reconstruct the page URL that originally contained the form.
-
-        For a POST /login form on example.com, the form page is
-        usually GET /login or the Referer/Origin header.
-        """
         host = self._host(request)
         path = request.path if request.path.startswith("/") else f"/{request.path}"
         referer = request.headers.get("Referer") or request.headers.get("referer")
@@ -96,34 +100,37 @@ class Engine:
             return referer
         return f"{self.protocol}://{host}{path}"
 
-    # ── send a single request ───────────────────────────────────
+    # ── send a single request (with semaphore) ──────────────────
 
-    def _send(self, request: Request, url: str, headers: dict, params: dict | None, body) -> Optional[httpx.Response]:
-        """Fire one request. Returns None on network errors instead of crashing."""
+    async def _send(self, request: Request, url: str, headers: dict,
+                    params: dict | None, body) -> Optional[httpx.Response]:
+        """Fire one request with concurrency control. Returns None on errors."""
         clean_h = self._clean_headers(headers)
         is_json = "application/json" in (request.headers.get("Content-Type", "") or "").lower()
-        try:
-            if is_json and isinstance(body, dict):
-                return self.client.request(
-                    method=request.method, url=url, headers=clean_h,
-                    params=params or None, json=body,
-                )
-            else:
-                return self.client.request(
-                    method=request.method, url=url, headers=clean_h,
-                    params=params or None, data=body if body else None,
-                )
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
-            if self.logger:
-                self.logger.warn(f"Request failed: {exc}")
-            return None
+
+        async with self.semaphore:
+            try:
+                if is_json and isinstance(body, dict):
+                    return await self.client.request(
+                        method=request.method, url=url, headers=clean_h,
+                        params=params or None, json=body,
+                    )
+                else:
+                    return await self.client.request(
+                        method=request.method, url=url, headers=clean_h,
+                        params=params or None, data=body if body else None,
+                    )
+            except (httpx.TimeoutException, httpx.ConnectError,
+                    httpx.RemoteProtocolError) as exc:
+                if self.logger:
+                    self.logger.warn(f"Request failed: {exc}")
+                return None
 
     # ── baseline capture ────────────────────────────────────────
 
-    def _capture_baseline(self, request: Request, url: str, headers: dict,
-                          params: dict | None, body) -> BaselineData:
-        """Send the original request WITHOUT any payload to capture normal behavior."""
-        resp = self._send(request, url, headers, params, body)
+    async def _capture_baseline(self, request: Request, url: str, headers: dict,
+                                params: dict | None, body) -> BaselineData:
+        resp = await self._send(request, url, headers, params, body)
         if resp is None:
             return BaselineData()
         return BaselineData(
@@ -137,7 +144,6 @@ class Engine:
     # ── CSRF token detection ────────────────────────────────────
 
     def _detect_and_log_csrf(self, params: dict, body: dict) -> tuple[list[str], list[str]]:
-        """Detect CSRF-like fields in query params and body. Returns (query_csrf, body_csrf)."""
         query_csrf = detect_csrf_fields(params) if params else []
         body_csrf = detect_csrf_fields(body) if isinstance(body, dict) else []
         if (query_csrf or body_csrf) and self.logger:
@@ -145,19 +151,17 @@ class Engine:
             self.logger.info(f"  CSRF tokens detected: {', '.join(all_csrf)} (will refresh per request)")
         return query_csrf, body_csrf
 
-    def _refresh_csrf(self, request: Request, params: dict, body: dict,
-                      query_csrf: list, body_csrf: list) -> tuple[dict, dict]:
-        """Fetch fresh CSRF tokens and inject them into params/body."""
+    async def _refresh_csrf(self, request: Request, params: dict, body: dict,
+                            query_csrf: list, body_csrf: list) -> tuple[dict, dict]:
         all_csrf = query_csrf + body_csrf
         if not all_csrf:
             return params, body
 
         page_url = self._form_page_url(request)
-        fresh = fetch_csrf_tokens(self.client, page_url, all_csrf)
+        fresh = await async_fetch_csrf_tokens(self.client, page_url, all_csrf)
         if not fresh:
             return params, body
 
-        # Inject fresh tokens
         new_params = deepcopy(params)
         new_body = deepcopy(body) if isinstance(body, dict) else body
         for field, value in fresh.items():
@@ -165,12 +169,11 @@ class Engine:
                 new_params[field] = value
             if field in body_csrf and isinstance(new_body, dict):
                 new_body[field] = value
-
         return new_params, new_body
 
     # ── main scan entry point ───────────────────────────────────
 
-    def scan(self, checker: BaseChecker, request: Request) -> List[CheckResult]:
+    async def scan(self, checker: BaseChecker, request: Request) -> List[CheckResult]:
         payloads = checker.get_payloads()
         results: List[CheckResult] = []
 
@@ -180,7 +183,6 @@ class Engine:
         orig_body = deepcopy(request.body) if isinstance(request.body, (dict, str)) else {}
         orig_headers = deepcopy(request.headers) if isinstance(request.headers, dict) else {}
 
-        # Detect FUZZ mode
         fuzz_in_path = isinstance(base_path, str) and "FUZZ" in base_path
         fuzz_in_params = self._has_fuzz(orig_params)
         fuzz_in_body = self._has_fuzz(orig_body)
@@ -192,25 +194,23 @@ class Engine:
         if self.logger:
             self.logger.info(f"Scanning {checker.name} @ {base_url}")
 
-        # Detect CSRF tokens
         query_csrf, body_csrf = self._detect_and_log_csrf(
             orig_params, orig_body if isinstance(orig_body, dict) else {}
         )
 
         # ── FUZZ mode ──────────────────────────────────────────
         if fuzz_mode:
-            # Baseline: send with FUZZ replaced by a harmless value
             bl_path = base_path.replace("FUZZ", "BASELINE_PROBE") if fuzz_in_path else base_path
             bl_params = self._apply_fuzz(orig_params, "BASELINE_PROBE") if fuzz_in_params else orig_params
             bl_body = self._apply_fuzz(orig_body, "BASELINE_PROBE") if fuzz_in_body else orig_body
             bl_headers = self._apply_fuzz(orig_headers, "BASELINE_PROBE") if fuzz_in_headers else orig_headers
             bl_url = f"{self.protocol}://{host}{bl_path}"
-            baseline = self._capture_baseline(request, bl_url, bl_headers, bl_params, bl_body)
+            baseline = await self._capture_baseline(request, bl_url, bl_headers, bl_params, bl_body)
 
-            total = len(payloads)
-            for idx, payload in enumerate(payloads, 1):
+            # Fire all payloads concurrently (semaphore limits in-flight)
+            async def _test_fuzz(idx: int, payload: str):
                 if self.logger and self.logger.verbose >= 2:
-                    self.logger.debug(f"[{idx}/{total}] FUZZ = {self.logger.PAY}{payload}{Style.RESET_ALL}")
+                    self.logger.debug(f"[{idx}/{len(payloads)}] FUZZ = {self.logger.PAY}{payload}{Style.RESET_ALL}")
 
                 path_mut = base_path.replace("FUZZ", payload) if fuzz_in_path else base_path
                 url = f"{self.protocol}://{host}{path_mut}"
@@ -218,15 +218,19 @@ class Engine:
                 body_mut = self._apply_fuzz(orig_body, payload) if fuzz_in_body else orig_body
                 headers_mut = self._apply_fuzz(orig_headers, payload) if fuzz_in_headers else orig_headers
 
-                resp = self._send(request, url, headers_mut, params_mut, body_mut)
+                resp = await self._send(request, url, headers_mut, params_mut, body_mut)
                 if resp is None:
-                    continue
-
+                    return None
                 result = checker.check(baseline, resp, payload)
                 if result:
                     result.location = "FUZZ"
                     result.param = "(FUZZ)"
                     result.status_code = resp.status_code
+                return result
+
+            tasks = [_test_fuzz(i, p) for i, p in enumerate(payloads, 1)]
+            for result in await asyncio.gather(*tasks):
+                if result:
                     results.append(result)
                     if self.logger:
                         self.logger.finding(result)
@@ -236,47 +240,50 @@ class Engine:
 
         # ── Normal mode (no FUZZ markers) ──────────────────────
 
-        # Capture baseline once
         baseline_params, baseline_body = orig_params, orig_body
         if query_csrf or body_csrf:
-            baseline_params, baseline_body = self._refresh_csrf(
+            baseline_params, baseline_body = await self._refresh_csrf(
                 request, orig_params, orig_body if isinstance(orig_body, dict) else {},
                 query_csrf, body_csrf,
             )
-        baseline = self._capture_baseline(request, base_url, orig_headers, baseline_params, baseline_body)
+        baseline = await self._capture_baseline(request, base_url, orig_headers, baseline_params, baseline_body)
 
-        # Scan query parameters
+        # Scan query params and body params concurrently
+        scan_tasks = []
+
         if orig_params:
             for param in orig_params:
-                # Skip CSRF token fields — don't inject into them
                 if param in query_csrf:
                     continue
-                results += self._scan_injection_point(
+                scan_tasks.append(self._scan_injection_point(
                     checker, request, base_url, orig_headers,
                     orig_params, orig_body, baseline,
                     target="query", param_name=param,
                     query_csrf=query_csrf, body_csrf=body_csrf,
-                )
+                ))
 
-        # Scan body parameters
         if orig_body and isinstance(orig_body, dict):
             for param in orig_body:
-                # Skip CSRF token fields — don't inject into them
                 if param in body_csrf:
                     continue
-                results += self._scan_injection_point(
+                scan_tasks.append(self._scan_injection_point(
                     checker, request, base_url, orig_headers,
                     orig_params, orig_body, baseline,
                     target="form", param_name=param,
                     query_csrf=query_csrf, body_csrf=body_csrf,
-                )
+                ))
+
+        if scan_tasks:
+            point_results = await asyncio.gather(*scan_tasks)
+            for pr in point_results:
+                results.extend(pr)
 
         self._log_summary(checker, results)
         return results
 
-    # ── inject into one parameter ───────────────────────────────
+    # ── inject into one parameter (async) ───────────────────────
 
-    def _scan_injection_point(
+    async def _scan_injection_point(
         self, checker: BaseChecker, request: Request, url: str,
         headers: dict, params: dict, body, baseline: BaselineData,
         target: str, param_name: str,
@@ -292,13 +299,12 @@ class Engine:
         if self.logger:
             self.logger.debug(f"Testing {target}.{param_name} ({total} payloads)")
 
-        for idx, payload in enumerate(payloads, 1):
-            # Refresh CSRF tokens if needed
+        async def _test_payload(idx: int, payload: str):
             cur_params = deepcopy(params)
             cur_body = deepcopy(body) if isinstance(body, dict) else body
 
             if has_csrf:
-                cur_params, cur_body = self._refresh_csrf(
+                cur_params, cur_body = await self._refresh_csrf(
                     request, cur_params,
                     cur_body if isinstance(cur_body, dict) else {},
                     query_csrf, body_csrf,
@@ -306,14 +312,14 @@ class Engine:
 
             if target == "query":
                 cur_params[param_name] = payload
-                resp = self._send(request, url, headers, cur_params, cur_body)
-            else:  # form
+                resp = await self._send(request, url, headers, cur_params, cur_body)
+            else:
                 if isinstance(cur_body, dict):
                     cur_body[param_name] = payload
-                resp = self._send(request, url, headers, cur_params, cur_body)
+                resp = await self._send(request, url, headers, cur_params, cur_body)
 
             if resp is None:
-                continue
+                return None
 
             if self.logger and self.logger.verbose >= 2:
                 self.logger.debug(
@@ -326,6 +332,11 @@ class Engine:
                 result.location = target
                 result.param = param_name
                 result.status_code = resp.status_code
+            return result
+
+        tasks = [_test_payload(i, p) for i, p in enumerate(payloads, 1)]
+        for result in await asyncio.gather(*tasks):
+            if result:
                 results.append(result)
                 if self.logger:
                     self.logger.finding(result)

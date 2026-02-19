@@ -7,8 +7,7 @@ Provides anti-CSRF token detection similar to sqlmap's approach:
 
 import re
 from html.parser import HTMLParser
-from typing import Dict, Optional, List, Tuple
-from urllib.parse import urljoin
+from typing import Dict, List
 
 import httpx
 
@@ -23,13 +22,12 @@ _CSRF_PATTERNS = [
     re.compile(r"authenticity", re.I),
     re.compile(r"__RequestVerificationToken", re.I),
     re.compile(r"_token", re.I),
-    re.compile(r"csrfmiddlewaretoken", re.I),   # Django
+    re.compile(r"csrfmiddlewaretoken", re.I),
     re.compile(r"_csrf_token", re.I),
-    re.compile(r"form_key", re.I),              # Magento
+    re.compile(r"form_key", re.I),
     re.compile(r"anti[-_]?forgery", re.I),
 ]
 
-# Field names that are NOT CSRF tokens even if they match patterns above
 _CSRF_EXCLUSIONS = [
     re.compile(r"^(username|password|email|search|query|q|s|id|name|url)$", re.I),
     re.compile(r"^(file|host|lang|page|action|submit|button|type)$", re.I),
@@ -38,11 +36,9 @@ _CSRF_EXCLUSIONS = [
 
 def is_csrf_field(field_name: str) -> bool:
     """Check if a form field name looks like an anti-CSRF token."""
-    # First check exclusions
     for excl in _CSRF_EXCLUSIONS:
         if excl.search(field_name):
             return False
-    # Then check CSRF patterns
     for pat in _CSRF_PATTERNS:
         if pat.search(field_name):
             return True
@@ -57,8 +53,6 @@ def detect_csrf_fields(params: Dict) -> List[str]:
 # ── Token extraction from HTML ─────────────────────────────────
 
 class _HiddenInputExtractor(HTMLParser):
-    """Extract hidden input fields from HTML forms."""
-
     def __init__(self):
         super().__init__()
         self.hidden_inputs: Dict[str, str] = {}
@@ -74,7 +68,6 @@ class _HiddenInputExtractor(HTMLParser):
 
 
 def extract_hidden_inputs(html: str) -> Dict[str, str]:
-    """Extract all hidden input name→value pairs from HTML."""
     parser = _HiddenInputExtractor()
     try:
         parser.feed(html)
@@ -83,34 +76,19 @@ def extract_hidden_inputs(html: str) -> Dict[str, str]:
     return parser.hidden_inputs
 
 
-def fetch_csrf_tokens(
-    client: httpx.Client,
+async def async_fetch_csrf_tokens(
+    client: httpx.AsyncClient,
     page_url: str,
     csrf_fields: List[str],
 ) -> Dict[str, str]:
-    """Fetch the page and extract fresh CSRF token values.
-
-    Args:
-        client: httpx.Client to use for the request
-        page_url: URL of the page containing the form
-        csrf_fields: list of field names to extract values for
-
-    Returns:
-        Dict of field_name → fresh_token_value
-    """
+    """Async: fetch the page and extract fresh CSRF token values."""
     if not csrf_fields:
         return {}
-
     try:
-        resp = client.get(page_url, follow_redirects=True)
+        resp = await client.get(page_url, follow_redirects=True)
         if resp.status_code != 200:
             return {}
-
         hidden = extract_hidden_inputs(resp.text or "")
-        tokens = {}
-        for field in csrf_fields:
-            if field in hidden:
-                tokens[field] = hidden[field]
-        return tokens
+        return {f: hidden[f] for f in csrf_fields if f in hidden}
     except Exception:
         return {}
