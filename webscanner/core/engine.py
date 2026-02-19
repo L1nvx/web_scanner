@@ -1,13 +1,19 @@
-"""Scan engine — orchestrates baseline + injection + differential detection."""
+"""Scan engine — orchestrates baseline + injection + differential detection.
+
+Handles CSRF token detection and refresh: if a form contains fields that look
+like anti-CSRF tokens, the engine fetches fresh tokens before each injection.
+"""
 
 import httpx
 from copy import deepcopy
 from typing import List, Optional
+from urllib.parse import urlunsplit, urlsplit
 
 from colorama import Style
 
 from webscanner.checkers.base import BaseChecker
 from webscanner.core.models import CheckResult, BaselineData
+from webscanner.core.csrf import detect_csrf_fields, fetch_csrf_tokens
 from webscanner.parsers.request import Request
 
 _STOP_HDRS = {"host", "content-length", "transfer-encoding", "content-encoding"}
@@ -22,7 +28,7 @@ class Engine:
         timeout: int = 15,
     ):
         self.name = "WebScanner"
-        self.version = "2.0.0"
+        self.version = "2.2.0"
         self.protocol = protocol
         self.logger = logger
         self.client = httpx.Client(
@@ -75,6 +81,21 @@ class Engine:
         """Remove hop-by-hop headers that break httpx."""
         return {k: v for k, v in headers.items() if k.lower() not in _STOP_HDRS}
 
+    # ── page URL helper (for CSRF token refresh) ────────────────
+
+    def _form_page_url(self, request: Request) -> str:
+        """Reconstruct the page URL that originally contained the form.
+
+        For a POST /login form on example.com, the form page is
+        usually GET /login or the Referer/Origin header.
+        """
+        host = self._host(request)
+        path = request.path if request.path.startswith("/") else f"/{request.path}"
+        referer = request.headers.get("Referer") or request.headers.get("referer")
+        if referer:
+            return referer
+        return f"{self.protocol}://{host}{path}"
+
     # ── send a single request ───────────────────────────────────
 
     def _send(self, request: Request, url: str, headers: dict, params: dict | None, body) -> Optional[httpx.Response]:
@@ -113,6 +134,40 @@ class Engine:
             headers=dict(resp.headers),
         )
 
+    # ── CSRF token detection ────────────────────────────────────
+
+    def _detect_and_log_csrf(self, params: dict, body: dict) -> tuple[list[str], list[str]]:
+        """Detect CSRF-like fields in query params and body. Returns (query_csrf, body_csrf)."""
+        query_csrf = detect_csrf_fields(params) if params else []
+        body_csrf = detect_csrf_fields(body) if isinstance(body, dict) else []
+        if (query_csrf or body_csrf) and self.logger:
+            all_csrf = query_csrf + body_csrf
+            self.logger.info(f"  CSRF tokens detected: {', '.join(all_csrf)} (will refresh per request)")
+        return query_csrf, body_csrf
+
+    def _refresh_csrf(self, request: Request, params: dict, body: dict,
+                      query_csrf: list, body_csrf: list) -> tuple[dict, dict]:
+        """Fetch fresh CSRF tokens and inject them into params/body."""
+        all_csrf = query_csrf + body_csrf
+        if not all_csrf:
+            return params, body
+
+        page_url = self._form_page_url(request)
+        fresh = fetch_csrf_tokens(self.client, page_url, all_csrf)
+        if not fresh:
+            return params, body
+
+        # Inject fresh tokens
+        new_params = deepcopy(params)
+        new_body = deepcopy(body) if isinstance(body, dict) else body
+        for field, value in fresh.items():
+            if field in query_csrf and isinstance(new_params, dict):
+                new_params[field] = value
+            if field in body_csrf and isinstance(new_body, dict):
+                new_body[field] = value
+
+        return new_params, new_body
+
     # ── main scan entry point ───────────────────────────────────
 
     def scan(self, checker: BaseChecker, request: Request) -> List[CheckResult]:
@@ -136,6 +191,11 @@ class Engine:
 
         if self.logger:
             self.logger.info(f"Scanning {checker.name} @ {base_url}")
+
+        # Detect CSRF tokens
+        query_csrf, body_csrf = self._detect_and_log_csrf(
+            orig_params, orig_body if isinstance(orig_body, dict) else {}
+        )
 
         # ── FUZZ mode ──────────────────────────────────────────
         if fuzz_mode:
@@ -177,24 +237,38 @@ class Engine:
         # ── Normal mode (no FUZZ markers) ──────────────────────
 
         # Capture baseline once
-        baseline = self._capture_baseline(request, base_url, orig_headers, orig_params, orig_body)
+        baseline_params, baseline_body = orig_params, orig_body
+        if query_csrf or body_csrf:
+            baseline_params, baseline_body = self._refresh_csrf(
+                request, orig_params, orig_body if isinstance(orig_body, dict) else {},
+                query_csrf, body_csrf,
+            )
+        baseline = self._capture_baseline(request, base_url, orig_headers, baseline_params, baseline_body)
 
         # Scan query parameters
         if orig_params:
             for param in orig_params:
+                # Skip CSRF token fields — don't inject into them
+                if param in query_csrf:
+                    continue
                 results += self._scan_injection_point(
                     checker, request, base_url, orig_headers,
                     orig_params, orig_body, baseline,
                     target="query", param_name=param,
+                    query_csrf=query_csrf, body_csrf=body_csrf,
                 )
 
         # Scan body parameters
         if orig_body and isinstance(orig_body, dict):
             for param in orig_body:
+                # Skip CSRF token fields — don't inject into them
+                if param in body_csrf:
+                    continue
                 results += self._scan_injection_point(
                     checker, request, base_url, orig_headers,
                     orig_params, orig_body, baseline,
                     target="form", param_name=param,
+                    query_csrf=query_csrf, body_csrf=body_csrf,
                 )
 
         self._log_summary(checker, results)
@@ -206,23 +280,37 @@ class Engine:
         self, checker: BaseChecker, request: Request, url: str,
         headers: dict, params: dict, body, baseline: BaselineData,
         target: str, param_name: str,
+        query_csrf: list | None = None, body_csrf: list | None = None,
     ) -> List[CheckResult]:
         results = []
         payloads = checker.get_payloads()
         total = len(payloads)
+        query_csrf = query_csrf or []
+        body_csrf = body_csrf or []
+        has_csrf = bool(query_csrf or body_csrf)
 
         if self.logger:
             self.logger.debug(f"Testing {target}.{param_name} ({total} payloads)")
 
         for idx, payload in enumerate(payloads, 1):
+            # Refresh CSRF tokens if needed
+            cur_params = deepcopy(params)
+            cur_body = deepcopy(body) if isinstance(body, dict) else body
+
+            if has_csrf:
+                cur_params, cur_body = self._refresh_csrf(
+                    request, cur_params,
+                    cur_body if isinstance(cur_body, dict) else {},
+                    query_csrf, body_csrf,
+                )
+
             if target == "query":
-                mutated = deepcopy(params)
-                mutated[param_name] = payload   # string, NOT [payload]
-                resp = self._send(request, url, headers, mutated, body)
+                cur_params[param_name] = payload
+                resp = self._send(request, url, headers, cur_params, cur_body)
             else:  # form
-                mutated = deepcopy(body)
-                mutated[param_name] = payload   # string, NOT [payload]
-                resp = self._send(request, url, headers, params, mutated)
+                if isinstance(cur_body, dict):
+                    cur_body[param_name] = payload
+                resp = self._send(request, url, headers, cur_params, cur_body)
 
             if resp is None:
                 continue

